@@ -1,0 +1,17 @@
+# 编译产物
+build/
+*.o
+*.so
+*.a
+controller
+test_*
+
+# IDE/编辑器
+.vscode/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+Thumbs.db
