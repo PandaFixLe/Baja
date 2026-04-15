@@ -15,10 +15,14 @@ set(SOURCES
     src/main.cpp
     src/pid_controller.cpp
     src/pure_pursuit_controller.cpp
+    tests/mock_path_generator.cpp
+    src/stanley_controller.cpp
 )
 
 # 5. 添加可执行目标
 add_executable(controller ${SOURCES})
+
+target_link_libraries(controller PRIVATE m)
 
 # 6. 编译选项（工程规范）
 target_compile_options(controller PRIVATE
@@ -38,3 +42,29 @@ endif()
 
 # 8. 输出信息（方便确认）
 message(STATUS "✅ 项目配置完成: ${PROJECT_NAME} v${PROJECT_VERSION}")
+
+# 启用测试
+enable_testing()
+
+# 自动下载 Google Test
+include(FetchContent)
+FetchContent_Declare(
+  googletest
+  GIT_REPOSITORY https://gitee.com/mirrors/googletest.git
+  GIT_TAG        release-1.11.0
+)
+FetchContent_MakeAvailable(googletest)
+
+# 添加单元测试可执行文件
+add_executable(test_pure_pursuit tests/test_pure_pursuit.cpp
+src/pure_pursuit_controller.cpp)
+target_link_libraries(test_pure_pursuit GTest::gtest_main)
+
+# 包含头文件目录
+target_include_directories(test_pure_pursuit PRIVATE 
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# 发现测试
+include(GoogleTest)
+gtest_discover_tests(test_pure_pursuit)

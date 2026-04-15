@@ -18,35 +18,28 @@ PurePursuitController::PurePursuitController(double lookahead, double wheelbase,
         wheelbase_ = 1.5;
     }
 }
-
+// 1232131
 double PurePursuitController::ComputeSteering(double error, double speed) {
-    // 🛡️ 输入有效性检查（工程红线）
-    if (lookahead_ < 0.1) {
-        std::cerr << "[PurePursuit] 错误: 预瞄距离过小!" << std::endl;
-        return 0.0;
-    }
-    
-    // 📐 纯追踪核心几何公式
-    // 简化版：假设 error 是横向偏差，预瞄点在正前方
-    // 曲率 κ = 2 * sin(α) / Ld ≈ 2 * error / Ld² (小角度近似)
-    double curvature = (2.0 * error) / (lookahead_ * lookahead_);
-    
-    // 🚗 自行车模型：曲率 → 前轮转角
-    // δ = atan2(L * κ, 1)
+    // 🎯 动态预瞄核心参数（实车经验初值）
+    double k_gain = 0.3;      // 速度增益系数：车速每+1m/s，预瞄+0.5m
+    double L_min = 1.5;       // 最小预瞄：防低速震荡
+    double L_max = 4.0;       // 最大预瞄：防高速反应迟钝
+
+    // 计算动态预瞄距离
+    double dynamic_lookahead = std::clamp(
+        L_min + k_gain * speed,
+        L_min, L_max
+    );
+
+    // 纯追踪几何公式
+    double curvature = (2.0 * error) / (dynamic_lookahead * dynamic_lookahead);
     double steering_angle = std::atan2(wheelbase_ * curvature, 1.0);
     
-    // 🚨 工程安全：转向角限幅（防止机械损坏/翻车）
+    // 转向限幅
     steering_angle = std::clamp(steering_angle, -max_steer_angle_, max_steer_angle_);
-    
-    // 📊 调试输出（实际项目中可用日志库替代）
-    std::cout << "[PurePursuit] 误差=" << error 
-              << " 预瞄=" << lookahead_ 
-              << " 曲率=" << curvature 
-              << " -> 转角=" << steering_angle << " rad\n";
-    
+
     return steering_angle;
 }
-
 std::string PurePursuitController::GetName() const {
     return "PurePursuit_Controller";
 }
