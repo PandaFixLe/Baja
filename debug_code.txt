@@ -1,0 +1,600 @@
+// src/main.cpp - 精简优化版
+#include <iostream>
+#include <memory>
+#include <fstream>
+#include <vector>
+#include <string>
+#include <iomanip>
+#include <algorithm>
+#include <cmath>
+
+#include "base_controller.h"
+#include "pid_controller.h"
+#include "pure_pursuit_controller.h"
+#include "stanley_controller.h"
+#include "../tests/mock_path_generator.h"
+
+// 📊 测试结果结构体（保持不变）
+struct TestResult {
+    std::string algo_name;
+    double parameter_value;
+    double max_error, avg_error, avg_steering;
+    bool oscillation;
+    double steering_jerk, max_steering_util;
+
+    // 综合评分：误差*1.0 + jerk*0.5 + 震荡惩罚*2.0
+    double GetScore() const {
+        return avg_error * 1.0 + steering_jerk * 0.5 + (oscillation ? 2.0 : 0);
+    }
+};
+
+// 🎬 仿真运行函数（保持不变，核心逻辑）
+TestResult RunSimulation(BaseController* controller, MockPathGenerator& mock_gen,
+                        double test_speed, bool verbose = false) {
+    mock_gen.Reset();
+
+    // 状态变量
+    double current_x = 0.0, current_y = 0.0, current_heading = 0.0;
+    double total_error = 0.0, total_steering = 0.0, max_error = 0.0;
+    double max_steering_observed = 0.0;
+    double prev_steering = 0.0;
+    double total_jerk = 0.0; // 累积转向角变化量
+    const double MAX_STEER_LIMIT = 0.6; // 实车舵机限幅 (rad)
+
+    std::vector<double> steering_history; // 用于震荡检测
+
+    if (verbose) {
+        std::cout << "\n=== 开始仿真: " << controller->GetName() << " ===\n";
+        std::cout << "--------------------------------------------------\n";
+    }
+
+    const int TOTAL_FRAMES = 250; // 5秒 @ 50Hz
+    for (int i = 0; i < TOTAL_FRAMES; ++i) {
+        // 1. 获取当前的预瞄距离 (如果是 PurePursuit)
+        double lookahead_dist = 2.0; // 默认值
+        auto* pp_ctrl = dynamic_cast<PurePursuitController*>(controller);
+        if (pp_ctrl) lookahead_dist = pp_ctrl->GetLookahead();
+
+        // 2. ✅ 关键修改：根据车的当前位置找目标点
+        // 注意：这里需要传入车的 current_x, current_y
+        PathPoint ref_point = mock_gen.GetTargetPoint(current_x, current_y, lookahead_dist);
+
+        // 3. 计算误差 (这里先简化用 Y 轴差值，后续需改进为垂直投影误差)
+        double lateral_error = ref_point.y - current_y;
+
+        // 【放在这里】如果是PurePursuit，动态更新参数
+        if (pp_ctrl && verbose) {
+            std::cout << "[Frame " << i << "] 当前预瞄距离: "
+                      << pp_ctrl->GetLookahead() << " m, 曲率: "
+                      << ref_point.curvature << " 1/m" << std::endl;
+        }
+
+        // 4. 控制器计算
+        double steering = controller->ComputeSteering(
+            lateral_error,
+            test_speed,
+            ref_point.curvature
+        );
+
+        // 3. 指标统计
+        double abs_err = std::abs(lateral_error);
+        double abs_steer = std::abs(steering);
+
+        total_error += abs_err;
+        total_steering += abs_steer;
+        if (abs_err > max_error) max_error = abs_err;
+        if (abs_steer > max_steering_observed) max_steering_observed = abs_steer;
+
+        // 转向角变化率 (Jerk)
+        double jerk = std::abs(steering - prev_steering);
+        total_jerk += jerk;
+        prev_steering = steering;
+
+        // 记录历史用于震荡检测
+        steering_history.push_back(steering);
+        if (steering_history.size() > 10) {
+            steering_history.erase(steering_history.begin());
+        }
+
+        // 4. 车辆运动学更新（自行车模型）
+        double L = 1.5; // 轴距
+        double yaw_rate = (test_speed / L) * std::tan(steering);
+        current_heading += yaw_rate * 0.02;
+        current_x += test_speed * std::cos(current_heading) * 0.02;
+        current_y += test_speed * std::sin(current_heading) * 0.02;
+
+        // 5. 详细日志输出
+        if (verbose && i % 10 == 0) {
+            std::cout << "t=" << (i * 0.02) << "s | "
+                      << "参考=(" << ref_point.x << ", " << ref_point.y << ") | "
+                      << "误差=" << lateral_error << "m | "
+                      << "转角=" << steering << "rad\n";
+        }
+    }
+
+    if (verbose) {
+        std::cout << "--------------------------------------------------\n";
+        std::cout << "✅ 仿真完成！\n";
+    }
+
+    // 震荡检测：最近10帧内符号变化 > 4次 判定为高频震荡
+    int sign_changes = 0;
+    for (size_t i = 1; i < steering_history.size(); ++i) {
+        if (steering_history[i] * steering_history[i-1] < 0) sign_changes++;
+    }
+
+    // 组装返回结果
+    TestResult result;
+    result.algo_name = controller->GetName();
+    result.parameter_value = 0.0; // 由调用方赋值
+    result.max_error = max_error;
+    result.avg_error = total_error / TOTAL_FRAMES;
+    result.avg_steering = total_steering / TOTAL_FRAMES;
+    result.oscillation = (sign_changes > 4);
+    result.steering_jerk = total_jerk / TOTAL_FRAMES;          // 平均每帧转向角跳变量
+    result.max_steering_util = max_steering_observed / MAX_STEER_LIMIT; // 限幅利用率
+
+    return result;
+}
+
+// 📋 打印结果表格（保持不变）
+void PrintResults(const std::vector<TestResult>& results) {
+    std::cout << "\n\n";
+    std::cout << "╔══════════════════════════════════════════════════════════════╗\n";
+    std::cout << "║                    参数测试结果汇总                           ║\n";
+    std::cout << "╠══════════╦══════════════╦══════════════╦════════════╦═══════╣\n";
+    std::cout << "║ 算法     ║ 测试参数 ║ 最大误差 ║ 平均误差 ║ 平均转角 ║ 震荡 ║\n";
+    std::cout << "╠══════════╬══════════════╬══════════════╬════════════╬═══════╣\n";
+
+    for (const auto& r : results) {
+        std::cout << "║ " << r.algo_name << std::setw(6) << " ║ " << std::fixed << std::setprecision(2)
+                  << std::setw(8) <<  r.parameter_value << "m  ║ "
+                  << std::setw(10) << r.max_error << "  ║ "
+                  << std::setw(10) << r.avg_error << "  ║ "
+                  << std::setw(8) << r.avg_steering << "rad ║ "
+                  << (r.oscillation ? "✅是" : "❌否")
+                  << std::setw(4) << " ║\n";
+    }
+
+    std::cout << "╚══════════╩══════════════╩══════════════╩════════════╩═══════╝\n";
+
+}
+// 算法对比总结
+void PrintAlgorithmComparison(const std::vector<TestResult>& results) {
+    double pp_avg_error = 0, pp_avg_jerk = 0;
+    double stanley_avg_error = 0, stanley_avg_jerk = 0;
+    int pp_count = 0, stanley_count = 0;
+
+    for (const auto& r : results) {
+        if (r.algo_name == "PurePursuit_Controller") {
+            pp_avg_error += r.avg_error;
+            pp_avg_jerk += r.steering_jerk;
+            pp_count++;
+        } else if (r.algo_name == "Stanley_Controller") {
+            stanley_avg_error += r.avg_error;
+            stanley_avg_jerk += r.steering_jerk;
+            stanley_count++;
+        }
+    }
+
+    if (pp_count > 0 && stanley_count > 0) {
+        pp_avg_error /= pp_count;
+        pp_avg_jerk /= pp_count;
+        stanley_avg_error /= stanley_count;
+        stanley_avg_jerk /= stanley_count;
+
+        std::cout << "\n📊 算法对比总结：\n";
+        std::cout << "   Pure Pursuit:  平均误差=" << pp_avg_error
+                  << "m, Jerk=" << pp_avg_jerk << "\n";
+        std::cout << "   Stanley:       平均误差=" << stanley_avg_error
+                  << "m, Jerk=" << stanley_avg_jerk << "\n";
+
+        if (stanley_avg_error < pp_avg_error * 0.9) {
+            std::cout << "   → Stanley 在跟踪精度上优势明显\n";
+        } else if (pp_avg_jerk < stanley_avg_jerk * 0.9) {
+            std::cout << "   → Pure Pursuit 在控制平滑性上优势明显\n";
+        } else {
+            std::cout << "   → 两种算法性能接近，需根据实车调优\n";
+        }
+    }
+}
+
+// 💾 保存CSV（保持不变）
+void SaveResultsToCSV(const std::vector<TestResult>& results, const std::string& filename) {
+    std::ofstream file(filename);
+    file << "algo,parameter,max_error,avg_error,avg_steering,oscillation,steering_jerk,max_steering_util\n";
+for (const auto& r : results) {
+    file << r.algo_name << ","
+         << r.parameter_value << ","
+         << r.max_error << ","
+         << r.avg_error << ","
+         << r.avg_steering << ","
+         << (r.oscillation ? "1" : "0") << ","
+         << r.steering_jerk << ","
+         << r.max_steering_util << "\n";
+}
+    file.close();
+    std::cout << "📄 结果已保存到: " << filename << "\n";
+}
+
+// 🏆 查找最佳结果（合并重复逻辑）
+const TestResult* FindBestResult(const std::vector<TestResult>& results) {
+    if (results.empty()) return nullptr;
+    return &(*std::min_element(results.begin(), results.end(),
+        [](const TestResult& a, const TestResult& b) {
+            return a.GetScore() < b.GetScore();
+        }));
+}
+
+// 🔧 创建控制器工厂（简化演示逻辑）
+std::unique_ptr<BaseController> CreateController(const std::string& name, double param) {
+    if (name == "Stanley_Controller") {
+        return std::make_unique<StanleyController>(param, 1.0, 0.6);
+    } else {
+        auto ctrl = std::make_unique<PurePursuitController>(2.0, 1.5, 0.6);
+        ctrl->SetDynamicParameters(0.3, 1.0, 4.0);
+        ctrl->SetCurvatureParameters(0.15, 0.8);
+        return ctrl;
+    }
+}
+
+// 🧪 参数扫描测试（模块化）
+std::vector<TestResult> RunParameterScan() {
+    std::vector<TestResult> results;
+    MockPathGenerator mock_gen;
+    mock_gen.GenerateCompetitionTrack();  // ✅ 使用组合路径
+
+    std::vector<double> test_params = {1.0, 1.5, 2.0, 2.5, 3.0}; // 预瞄距离或Kp
+
+    for (double param : test_params) {
+        // Pure Pursuit 测试
+        auto pp = std::make_unique<PurePursuitController>(param, 1.5, 0.6);
+        pp->SetDynamicParameters(0.3, 1.0, 4.0);
+        pp->SetCurvatureParameters(0.15, 0.8);
+
+        TestResult res = RunSimulation(pp.get(), mock_gen, 3.0, false);
+        res.algo_name = "PurePursuit";
+        res.parameter_value = param;
+        results.push_back(res);
+
+        // Stanley 测试（可选）
+        auto stanley = std::make_unique<StanleyController>(param, 1.0, 0.6);
+        res = RunSimulation(stanley.get(), mock_gen, 3.0, false);
+        res.algo_name = "Stanley";
+        res.parameter_value = param;
+        results.push_back(res);
+    }
+    return results;
+}
+
+// 🚀 动态预瞄效果验证（模块化）
+void RunDynamicLookaheadTest() {
+    std::cout << "\n🔍 动态预瞄效果验证（不同速度+曲率）\n";
+
+    MockPathGenerator mock_gen;
+    mock_gen.GenerateCompetitionTrack();
+
+    auto controller = std::make_unique<PurePursuitController>(2.0, 1.5, 0.6);
+    controller->SetDynamicParameters(0.3, 1.0, 4.0);
+    controller->SetCurvatureParameters(0.15, 0.8);
+
+    std::vector<double> speeds = {1.0, 2.5, 4.0};
+
+    for (double v : speeds) {
+        mock_gen.Reset();
+        TestResult res = RunSimulation(controller.get(), mock_gen, v, false);
+        std::cout << "📊 v=" << v << "m/s → 平均误差:" << res.avg_error
+                  << "m | Jerk:" << res.steering_jerk
+                  << (res.oscillation ? " ⚠️震荡" : " ✅稳定") << "\n";
+    }
+}
+
+// 🎯 主函数：流程清晰，只负责调度
+int main() {
+    std::cout << "🏎️ 智能巴哈赛车规控 - 精简测试框架\n";
+    std::cout << "=====================================\n\n";
+
+    // 1️⃣ 参数扫描
+    std::cout << "📋 Step 1: 参数扫描测试\n";
+    auto results = RunParameterScan();
+    PrintResults(results);
+    SaveResultsToCSV(results, "build/scan_results.csv");
+
+    // 2️⃣ 动态预瞄验证
+    std::cout << "\n📋 Step 2: 动态预瞄效果验证\n";
+    RunDynamicLookaheadTest();
+
+    // 3️⃣ 推荐最佳参数
+    std::cout << "\n📋 Step 3: 推荐最佳参数\n";
+    const TestResult* best = FindBestResult(results);
+    if (best) {
+        std::cout << "🏆 推荐: " << best->algo_name
+                  << " | 参数=" << best->parameter_value
+                  << " | 综合评分=" << best->GetScore() << "\n";
+        std::cout << "   理由: 误差=" << best->avg_error << "m, Jerk=" << best->steering_jerk << "\n";
+
+        // 4️⃣ 详细演示最佳参数
+        std::cout << "\n🎬 详细演示最佳参数:\n";
+        MockPathGenerator demo_gen;
+        demo_gen.GenerateCompetitionTrack();
+        auto demo_ctrl = CreateController(best->algo_name, best->parameter_value);
+        RunSimulation(demo_ctrl.get(), demo_gen, 3.0, false);
+    }
+
+    std::cout << "\n✅ 测试完成！结果已保存到 build/ 目录\n";
+    return 0;
+}#include "mock_path_generator.h"
+#include <iostream>
+#include <cmath>
+
+MockPathGenerator::MockPathGenerator() 
+    : current_idx_(0), current_x_(0.0), current_y_(0.0), current_heading_(0.0) {
+    std::cout << "[MockPathGenerator] 初始化完成\n";
+}
+
+MockPathGenerator::~MockPathGenerator() {}
+
+void MockPathGenerator::Clear() {
+    path_.clear();
+    current_idx_ = 0;
+    current_x_ = 0.0;
+    current_y_ = 0.0;
+    current_heading_ = 0.0;
+}
+
+void MockPathGenerator::Reset() {
+    current_idx_ = 0;
+}
+
+bool MockPathGenerator::IsFinished() const {
+    return current_idx_ >= path_.size();
+}
+
+PathPoint MockPathGenerator::GetNextPoint() {
+    if (current_idx_ < path_.size()) {
+        return path_[current_idx_++];
+    }
+    // 返回最后一个点
+    if (!path_.empty()) {
+        return path_.back();
+    }
+    return PathPoint();
+}
+
+// 在 mock_path_generator.cpp 中实现
+PathPoint MockPathGenerator::GetTargetPoint(double car_x, double car_y, double lookahead_dist) {
+    // 1. 找到距离车身最近的点
+    size_t closest_idx = 0;
+    double min_dist = 1e9;
+    for (size_t i = 0; i < path_.size(); ++i) {
+        double d = std::hypot(path_[i].x - car_x, path_[i].y - car_y);
+        if (d < min_dist) {
+            min_dist = d;
+            closest_idx = i;
+        }
+    }
+
+    // 2. 从最近点开始，沿路径向前累积距离，直到达到 lookahead_dist
+    double accumulated_dist = 0;
+    for (size_t i = closest_idx; i < path_.size() - 1; ++i) {
+        double seg_len = std::hypot(path_[i+1].x - path_[i].x, path_[i+1].y - path_[i].y);
+        accumulated_dist += seg_len;
+        
+        if (accumulated_dist >= lookahead_dist) {
+            return path_[i]; // 找到目标点
+        }
+    }
+    return path_.back(); // 如果路径不够长，返回终点
+}
+
+void MockPathGenerator::AddPoint(double x, double y, double heading, double curvature, double speed_limit) {
+    double timestamp = path_.empty() ? 0.0 : path_.back().timestamp + dt_;
+    path_.emplace_back(x, y, heading, curvature, speed_limit, timestamp);
+}
+
+double MockPathGenerator::CalculateHeading(double x1, double y1, double x2, double y2) {
+    return std::atan2(y2 - y1, x2 - x1);
+}
+
+double MockPathGenerator::CalculateCurvature(double radius) {
+    if (std::abs(radius) < 1e-6) {
+        return 0.0;
+    }
+    return 1.0 / radius;
+}
+
+void MockPathGenerator::GenerateStraightLine(double length) {
+    path_.clear();
+    current_idx_ = 0;
+    
+    double num_points = length / 0.5;  // 每 0.5m 一个点
+    for (int i = 0; i <= num_points; ++i) {
+        PathPoint pt;
+        pt.x = i * 0.5;
+        pt.y = 0.0;
+        pt.heading = 0.0;
+        pt.curvature = 0.0;
+        pt.speed_limit = 5.0;
+        pt.timestamp = i * dt_;
+        path_.push_back(pt);
+    }
+    
+    std::cout << "[Mock] 生成直线路径，长度=" << length << "m, 点数=" << path_.size() << "\n";
+}
+
+void MockPathGenerator::GenerateCircle(double radius) {
+    path_.clear();
+    current_idx_ = 0;
+    
+    int num_points = 100;  // 100 个点画圆
+    double angle_step = 2 * M_PI / num_points;
+    
+    for (int i = 0; i < num_points; ++i) {
+        PathPoint pt;
+        double angle = i * angle_step;
+        pt.x = radius * std::cos(angle);
+        pt.y = radius * std::sin(angle);
+        pt.heading = angle + M_PI / 2;  // 切线方向
+        pt.curvature = 1.0 / radius;
+        pt.speed_limit = 2.0;
+        pt.timestamp = i * dt_;
+        path_.push_back(pt);
+    }
+    
+    std::cout << "[Mock] 生成圆形路径，半径=" << radius << "m, 点数=" << path_.size() << "\n";
+}
+
+void MockPathGenerator::GenerateSineWave(double amplitude, double wavelength) {
+    path_.clear();
+    current_idx_ = 0;
+    
+    double total_length = wavelength * 2;  // 两个周期
+    int num_points = static_cast<int>(total_length / 0.5);
+    
+    for (int i = 0; i < num_points; ++i) {
+        PathPoint pt;
+        double x = i * 0.5;
+        double y = amplitude * std::sin(2 * M_PI * x / wavelength);
+        
+        pt.x = x;
+        pt.y = y;
+        pt.heading = std::atan2(amplitude * 2 * M_PI / wavelength * std::cos(2 * M_PI * x / wavelength), 1.0);
+        pt.curvature = 0.05;  // 简化曲率
+        pt.speed_limit = 3.0;
+        pt.timestamp = i * dt_;
+        path_.push_back(pt);
+    }
+    
+    std::cout << "[Mock] 生成S弯路径，振幅=" << amplitude << "m, 波长=" << wavelength << "m\n";
+}
+
+void MockPathGenerator::GenerateSineWaveAppend(double amplitude, double wavelength) {
+    double total_length = wavelength * 2;  // 两个周期
+    int num_points = static_cast<int>(total_length / 0.5);
+    
+    for (int i = 0; i < num_points; ++i) {
+        double s = i * 0.5;  // 沿路径的距离
+        
+        // ✅ 正确：x是沿前进方向的距离
+        double x = current_x_ + s * std::cos(current_heading_);
+        
+        // ✅ 正确：y是垂直于前进方向的偏移
+        // 计算垂直于前进方向的单位向量
+        double perp_x = -std::sin(current_heading_);
+        double perp_y = std::cos(current_heading_);
+        
+        double offset = amplitude * std::sin(2 * M_PI * s / wavelength);
+        
+        double y = current_y_ + offset;  // 简化版：直接加偏移
+        
+        // 计算航向角（切线方向）
+        double dy_ds = amplitude * 2 * M_PI / wavelength * std::cos(2 * M_PI * s / wavelength);
+        double heading = current_heading_ + std::atan(dy_ds);
+        
+        // 计算曲率
+        double d2y_ds2 = -amplitude * std::pow(2 * M_PI / wavelength, 2) * 
+                         std::sin(2 * M_PI * s / wavelength);
+        double curvature = d2y_ds2 / std::pow(1 + dy_ds * dy_ds, 1.5);
+        
+        AddPoint(x, y, heading, curvature, 3.0);
+    }
+    
+    // 更新终点位置
+    current_x_ += total_length * std::cos(current_heading_);
+    current_y_ += total_length * std::sin(current_heading_);
+}
+void MockPathGenerator::GenerateStraight(double length, double speed_limit) {
+    double step = 0.5;
+    int num_points = static_cast<int>(length / step);
+    
+    for (int i = 0; i <= num_points; ++i) {
+        double x = current_x_ + i * step * std::cos(current_heading_);
+        double y = current_y_ + i * step * std::sin(current_heading_);
+        AddPoint(x, y, current_heading_, 0.0, speed_limit);
+    }
+    
+    current_x_ += length * std::cos(current_heading_);
+    current_y_ += length * std::sin(current_heading_);
+}
+
+void MockPathGenerator::GenerateCurve(double radius, double angle_deg, bool clockwise, double speed_limit) {
+    double angle_rad = angle_deg * M_PI / 180.0;
+    int num_points = static_cast<int>(std::abs(angle_deg) / 2.0);
+    double angle_step = angle_rad / num_points;
+    
+    double direction = clockwise ? -1.0 : 1.0;
+    double center_x = current_x_ - direction * radius * std::sin(current_heading_);
+    double center_y = current_y_ + direction * radius * std::cos(current_heading_);
+    
+    double start_angle = std::atan2(current_y_ - center_y, current_x_ - center_x);
+    
+    for (int i = 0; i <= num_points; ++i) {
+        double current_angle = start_angle + direction * i * angle_step;
+        double x = center_x + radius * std::cos(current_angle);
+        double y = center_y + radius * std::sin(current_angle);
+        double heading = current_angle + (clockwise ? -M_PI/2 : M_PI/2);
+        
+        AddPoint(x, y, heading, direction / radius, speed_limit);
+    }
+    
+    current_x_ = center_x + radius * std::cos(start_angle + direction * angle_rad);
+    current_y_ = center_y + radius * std::sin(start_angle + direction * angle_rad);
+    current_heading_ += direction * angle_rad;
+}
+
+void MockPathGenerator::GenerateCompetitionTrack() {
+    Clear();
+    std::cout << "=== 生成比赛赛道 ===\n";
+    
+    GenerateStraight(20.0, 4.0);
+    GenerateSineWaveAppend(12.0, 25.0);
+    GenerateCurve(15.0, 90.0, true, 3.5);
+    GenerateStraight(15.0, 4.0);
+    GenerateCurve(8.0, 180.0, true, 1.5);
+    GenerateStraight(30.0, 6.0);
+    
+    std::cout << "赛道生成完成！总点数：" << path_.size() << "\n";
+}
+
+void MockPathGenerator::GenerateHairpinTestSection() {
+    Clear();
+    std::cout << "=== 生成发卡弯测试段 ===\n";
+    
+    GenerateStraight(15.0, 2.0);
+    GenerateCurve(6.0, 180.0, true, 1.2);
+    GenerateStraight(5.0, 2.0);
+    GenerateCurve(10.0, 180.0, false, 1.8);
+    
+    std::cout << "发卡弯测试段完成！\n";
+}
+
+void MockPathGenerator::GenerateHighSpeedSection() {
+    Clear();
+    std::cout << "=== 生成高速循迹测试段 ===\n";
+    
+    GenerateStraight(20.0, 5.0);
+    GenerateCurve(30.0, 45.0, true, 6.0);
+    GenerateStraight(30.0, 7.0);
+    
+    std::cout << "高速循迹测试段完成！\n";
+}
+
+void MockPathGenerator::GenerateOffroadObstacles() {
+    Clear();
+    std::cout << "=== 生成越野障碍段 ===\n";
+    
+    GenerateStraight(10.0, 3.0);
+    
+    // 模拟搓板路
+    for (int i = 0; i < 50; ++i) {
+        double x = current_x_ + i * 0.2 * std::cos(current_heading_);
+        double y = current_y_ + i * 0.2 * std::sin(current_heading_);
+        AddPoint(x, y, current_heading_, 0.0, 2.0);
+    }
+    current_x_ += 10.0 * std::cos(current_heading_);
+    current_y_ += 10.0 * std::sin(current_heading_);
+    
+    GenerateSineWave(8.0, 15.0);
+    
+    std::cout << "越野障碍段完成！\n";
+}

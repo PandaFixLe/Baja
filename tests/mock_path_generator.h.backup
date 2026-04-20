@@ -1,0 +1,97 @@
+#ifndef MOCK_PATH_GENERATOR_H
+#define MOCK_PATH_GENERATOR_H
+
+#include <vector>
+#include <string>
+#include <cmath>
+
+struct PathPoint {
+    double x;           // X坐标 (m)
+    double y;           // Y坐标 (m)
+    double heading;     // 航向角 (rad)
+    double curvature;   // 曲率 (1/m)
+    double speed_limit; // 建议速度 (m/s)
+    
+    PathPoint() : x(0), y(0), heading(0), curvature(0), speed_limit(3.0) {}
+    PathPoint(double x_, double y_, double h_, double c_, double v_)
+        : x(x_), y(y_), heading(h_), curvature(c_), speed_limit(v_) {}
+};
+
+class MockPathGenerator {
+public:
+    MockPathGenerator();
+    ~MockPathGenerator();
+    
+    // 清除所有路径点
+    void Clear();
+    
+    // 获取下一个路径点
+    PathPoint GetNextPoint();
+    
+    // 获取所有路径点
+    const std::vector<PathPoint>& GetAllPoints() const { return path_points_; }
+    
+    // 重置到起点
+    void Reset();
+    
+    // ========== 基本路径生成函数 ==========
+    
+    // 生成直道
+    // length: 长度 (m)
+    // speed_limit: 该段建议速度 (m/s)
+    void GenerateStraight(double length, double speed_limit = 5.0);
+    
+    // 生成S弯
+    // amplitude: 振幅 (m) - 控制S弯的宽度
+    // wavelength: 波长 (m) - 控制S弯的周期
+    // num_cycles: 周期数
+    // speed_limit: 该段建议速度 (m/s)
+    void GenerateSineWave(double amplitude, double wavelength, int num_cycles = 2, double speed_limit = 3.0);
+    
+    // 生成圆弧弯（发卡弯）
+    // radius: 半径 (m) - 规则要求 R=6-10m
+    // angle_deg: 角度 (deg) - 发卡弯通常90-180度
+    // clockwise: 顺时针(true)或逆时针(false)
+    // speed_limit: 该段建议速度 (m/s)
+    void GenerateCircle(double radius, double angle_deg = 90.0, bool clockwise = true, double speed_limit = 1.5);
+    
+    // 生成缓弯（中半径弯）
+    // radius: 半径 (m) - 规则要求 R=12-20m
+    // angle_deg: 角度 (deg)
+    // clockwise: 顺时针(true)或逆时针(false)
+    // speed_limit: 该段建议速度 (m/s)
+    void GenerateCurve(double radius, double angle_deg, bool clockwise = true, double speed_limit = 3.0);
+    
+    // ========== 组合路径生成函数 ==========
+    
+    // 生成符合规则的完整测试赛道
+    // 包含：直道 -> S弯 -> 发卡弯 -> 高速直道
+    void GenerateCompetitionTrack();
+    
+    // 生成发卡弯测试段
+    void GenerateHairpinTestSection();
+    
+    // 生成高速循迹测试段
+    void GenerateHighSpeedSection();
+    
+    // 生成越野障碍段
+    void GenerateOffroadObstacles();
+    
+private:
+    std::vector<PathPoint> path_points_;
+    size_t current_index_;
+    double current_x_;
+    double current_y_;
+    double current_heading_;
+    
+    // 添加路径点
+    void AddPoint(double x, double y, double heading, double curvature, double speed_limit);
+    
+    // 计算两点间的航向角
+    double CalculateHeading(double x1, double y1, double x2, double y2);
+    
+    // 计算曲率
+    double CalculateCurvature(double radius);
+};
+
+#endif // MOCK_PATH_GENERATOR_H

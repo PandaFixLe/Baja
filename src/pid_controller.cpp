@@ -4,7 +4,7 @@
 PIDController::PIDController(double kp, double ki, double kd)
     : kp_(kp), ki_(ki), kd_(kd), integral_(0), prev_error_(0) {}
 
-double PIDController::ComputeSteering(double error, double speed) {
+double PIDController::ComputeSteering(double error, double speed, double curvature, double current_heading) {
     // 简化版 PID（实际需加积分限幅、微分滤波）
     integral_ += error;
     double derivative = error - prev_error_;

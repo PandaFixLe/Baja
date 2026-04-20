@@ -1,8 +1,86 @@
 #include "mock_path_generator.h"
 #include <iostream>
+#include <cmath>
 
-MockPathGenerator::MockPathGenerator() {
+MockPathGenerator::MockPathGenerator() 
+    : current_idx_(0), current_x_(0.0), current_y_(0.0), current_heading_(0.0) {
     std::cout << "[MockPathGenerator] 初始化完成\n";
+}
+
+MockPathGenerator::~MockPathGenerator() {}
+
+void MockPathGenerator::Clear() {
+    path_.clear();
+    current_idx_ = 0;
+    current_x_ = 0.0;
+    current_y_ = 0.0;
+    current_heading_ = 0.0;
+}
+
+void MockPathGenerator::Reset() {
+    current_idx_ = 0;
+}
+
+bool MockPathGenerator::IsFinished() const {
+    return current_idx_ >= path_.size();
+}
+
+PathPoint MockPathGenerator::GetNextPoint() {
+    if (current_idx_ < path_.size()) {
+        return path_[current_idx_++];
+    }
+    // 返回最后一个点
+    if (!path_.empty()) {
+        return path_.back();
+    }
+    return PathPoint();
+}
+
+// 在 mock_path_generator.cpp 中实现
+PathPoint MockPathGenerator::GetTargetPoint(double car_x, double car_y, double lookahead_dist) {
+    if (path_.empty()) return PathPoint();
+
+    // 1. 找最近点
+    size_t closest_idx = 0;
+    double min_dist = 1e9;
+    for (size_t i = 0; i < path_.size(); ++i) {
+        double d = std::hypot(path_[i].x - car_x, path_[i].y - car_y);
+        if (d < min_dist) {
+            min_dist = d;
+            closest_idx = i;
+        }
+    }
+
+    // 2. 沿路径累积距离
+    double accumulated_dist = 0;
+    // ✅ 修复：从 closest_idx 开始，不要漏掉第一段
+    for (size_t i = closest_idx; i < path_.size() - 1; ++i) {
+        double seg_len = std::hypot(path_[i+1].x - path_[i].x, path_[i+1].y - path_[i].y);
+        accumulated_dist += seg_len;
+        
+        // ✅ 修复：当累积距离达到预瞄值，返回当前段的终点 (i+1)，或者进行插值
+        // 简单起见，返回超过阈值的那个点，这样预瞄距离只会偏大一点点，比偏小好
+        if (accumulated_dist >= lookahead_dist) {
+            return path_[i+1]; 
+        }
+    }
+    return path_.back();
+}
+
+void MockPathGenerator::AddPoint(double x, double y, double heading, double curvature, double speed_limit) {
+    double timestamp = path_.empty() ? 0.0 : path_.back().timestamp + dt_;
+    path_.emplace_back(x, y, heading, curvature, speed_limit, timestamp);
+}
+
+double MockPathGenerator::CalculateHeading(double x1, double y1, double x2, double y2) {
+    return std::atan2(y2 - y1, x2 - x1);
+}
+
+double MockPathGenerator::CalculateCurvature(double radius) {
+    if (std::abs(radius) < 1e-6) {
+        return 0.0;
+    }
+    return 1.0 / radius;
 }
 
 void MockPathGenerator::GenerateStraightLine(double length) {
@@ -14,7 +92,9 @@ void MockPathGenerator::GenerateStraightLine(double length) {
         PathPoint pt;
         pt.x = i * 0.5;
         pt.y = 0.0;
-        pt.heading = 0.0;  // 直线，航向角为 0
+        pt.heading = 0.0;
+        pt.curvature = 0.0;
+        pt.speed_limit = 5.0;
         pt.timestamp = i * dt_;
         path_.push_back(pt);
     }
@@ -35,6 +115,8 @@ void MockPathGenerator::GenerateCircle(double radius) {
         pt.x = radius * std::cos(angle);
         pt.y = radius * std::sin(angle);
         pt.heading = angle + M_PI / 2;  // 切线方向
+        pt.curvature = 1.0 / radius;
+        pt.speed_limit = 2.0;
         pt.timestamp = i * dt_;
         path_.push_back(pt);
     }
@@ -46,33 +128,156 @@ void MockPathGenerator::GenerateSineWave(double amplitude, double wavelength) {
     path_.clear();
     current_idx_ = 0;
     
-    double total_length = wavelength * 2;  // 2 个周期
-    int num_points = total_length / 0.5;
+    double total_length = wavelength * 2;  // 两个周期
+    int num_points = static_cast<int>(total_length / 0.5);
     
-    for (int i = 0; i <= num_points; ++i) {
+    for (int i = 0; i < num_points; ++i) {
         PathPoint pt;
         double x = i * 0.5;
         double y = amplitude * std::sin(2 * M_PI * x / wavelength);
         
         pt.x = x;
         pt.y = y;
-        // 计算切线方向（导数）
         pt.heading = std::atan2(amplitude * 2 * M_PI / wavelength * std::cos(2 * M_PI * x / wavelength), 1.0);
+        pt.curvature = 0.05;  // 简化曲率
+        pt.speed_limit = 3.0;
         pt.timestamp = i * dt_;
         path_.push_back(pt);
     }
     
-    std::cout << "[Mock] 生成正弦波路径，振幅=" << amplitude << "m, 波长=" << wavelength << "m\n";
+    std::cout << "[Mock] 生成S弯路径，振幅=" << amplitude << "m, 波长=" << wavelength << "m\n";
 }
 
-PathPoint MockPathGenerator::GetNextPoint() {
-    if (current_idx_ >= path_.size()) {
-        // 循环播放
-        current_idx_ = 0;
+void MockPathGenerator::GenerateSineWaveAppend(double amplitude, double wavelength) {
+    double total_length = wavelength * 2;  // 两个周期
+    int num_points = static_cast<int>(total_length / 0.5);
+    
+    for (int i = 0; i < num_points; ++i) {
+        double s = i * 0.5;  // 沿路径的距离
+        
+        // 计算横向偏移
+        double offset = amplitude * std::sin(2 * M_PI * s / wavelength);
+        
+        // 前进方向的单位向量
+        double dir_x = std::cos(current_heading_);
+        double dir_y = std::sin(current_heading_);
+        
+        // 垂直方向的单位向量（向左）
+        double perp_x = -dir_y;
+        double perp_y = dir_x;
+        
+        // 位置计算
+        double x = current_x_ + s * dir_x + offset * perp_x;
+        double y = current_y_ + s * dir_y + offset * perp_y;
+        
+        // 计算航向角（切线方向）
+        double dy_ds = amplitude * 2 * M_PI / wavelength * std::cos(2 * M_PI * s / wavelength);
+        double heading = current_heading_ + std::atan2(dy_ds, 1.0);
+        
+        // 计算曲率
+        double d2y_ds2 = -amplitude * std::pow(2 * M_PI / wavelength, 2) * 
+                         std::sin(2 * M_PI * s / wavelength);
+        double curvature = d2y_ds2 / std::pow(1 + dy_ds * dy_ds, 1.5);
+        
+        AddPoint(x, y, heading, curvature, 3.0);
     }
-    return path_[current_idx_++];
+    
+    // 更新终点位置（S弯结束时offset回到0，所以只前进total_length）
+    current_x_ += total_length * std::cos(current_heading_);
+    current_y_ += total_length * std::sin(current_heading_);
+}
+void MockPathGenerator::GenerateStraight(double length, double speed_limit) {
+    double step = 0.5;
+    int num_points = static_cast<int>(length / step);
+    
+    for (int i = 0; i <= num_points; ++i) {
+        double x = current_x_ + i * step * std::cos(current_heading_);
+        double y = current_y_ + i * step * std::sin(current_heading_);
+        AddPoint(x, y, current_heading_, 0.0, speed_limit);
+    }
+    
+    current_x_ += length * std::cos(current_heading_);
+    current_y_ += length * std::sin(current_heading_);
 }
 
-bool MockPathGenerator::IsFinished() const {
-    return current_idx_ >= path_.size();
+void MockPathGenerator::GenerateCurve(double radius, double angle_deg, bool clockwise, double speed_limit) {
+    double angle_rad = angle_deg * M_PI / 180.0;
+    int num_points = static_cast<int>(std::abs(angle_deg) / 2.0);
+    double angle_step = angle_rad / num_points;
+    
+    double direction = clockwise ? -1.0 : 1.0;
+    double center_x = current_x_ - direction * radius * std::sin(current_heading_);
+    double center_y = current_y_ + direction * radius * std::cos(current_heading_);
+    
+    double start_angle = std::atan2(current_y_ - center_y, current_x_ - center_x);
+    
+    for (int i = 0; i <= num_points; ++i) {
+        double current_angle = start_angle + direction * i * angle_step;
+        double x = center_x + radius * std::cos(current_angle);
+        double y = center_y + radius * std::sin(current_angle);
+        double heading = current_angle + (clockwise ? -M_PI/2 : M_PI/2);
+        
+        AddPoint(x, y, heading, direction / radius, speed_limit);
+    }
+    
+    current_x_ = center_x + radius * std::cos(start_angle + direction * angle_rad);
+    current_y_ = center_y + radius * std::sin(start_angle + direction * angle_rad);
+    current_heading_ += direction * angle_rad;
+}
+
+void MockPathGenerator::GenerateCompetitionTrack() {
+    Clear();
+    std::cout << "=== 生成比赛赛道 ===\n";
+    
+    GenerateStraight(20.0, 4.0);
+    GenerateSineWaveAppend(12.0, 25.0);
+    GenerateCurve(15.0, 90.0, true, 3.5);
+    GenerateStraight(15.0, 4.0);
+    GenerateCurve(8.0, 180.0, true, 1.5);
+    GenerateStraight(30.0, 6.0);
+    
+    std::cout << "赛道生成完成！总点数：" << path_.size() << "\n";
+}
+
+void MockPathGenerator::GenerateHairpinTestSection() {
+    Clear();
+    std::cout << "=== 生成发卡弯测试段 ===\n";
+    
+    GenerateStraight(15.0, 2.0);
+    GenerateCurve(6.0, 180.0, true, 1.2);
+    GenerateStraight(5.0, 2.0);
+    GenerateCurve(10.0, 180.0, false, 1.8);
+    
+    std::cout << "发卡弯测试段完成！\n";
+}
+
+void MockPathGenerator::GenerateHighSpeedSection() {
+    Clear();
+    std::cout << "=== 生成高速循迹测试段 ===\n";
+    
+    GenerateStraight(20.0, 5.0);
+    GenerateCurve(30.0, 45.0, true, 6.0);
+    GenerateStraight(30.0, 7.0);
+    
+    std::cout << "高速循迹测试段完成！\n";
+}
+
+void MockPathGenerator::GenerateOffroadObstacles() {
+    Clear();
+    std::cout << "=== 生成越野障碍段 ===\n";
+    
+    GenerateStraight(10.0, 3.0);
+    
+    // 模拟搓板路
+    for (int i = 0; i < 50; ++i) {
+        double x = current_x_ + i * 0.2 * std::cos(current_heading_);
+        double y = current_y_ + i * 0.2 * std::sin(current_heading_);
+        AddPoint(x, y, current_heading_, 0.0, 2.0);
+    }
+    current_x_ += 10.0 * std::cos(current_heading_);
+    current_y_ += 10.0 * std::sin(current_heading_);
+    
+    GenerateSineWave(8.0, 15.0);
+    
+    std::cout << "越野障碍段完成！\n";
 }

@@ -11,7 +11,7 @@ public:
     PIDController(double kp, double ki, double kd);
     
     // 核心算法（必须实现）
-    double ComputeSteering(double error, double speed) override;
+    double ComputeSteering(double error, double speed, double curvature = 0.0,double current_heading= 0.0) override;
     
     // 重写接口
     std::string GetName() const override;

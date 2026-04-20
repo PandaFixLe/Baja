@@ -1,5 +1,4 @@
-#pragma once  // 防止重复包含（比 #ifndef 更简洁）
-
+#pragma once
 #include <string>
 #include <memory>
 
@@ -7,15 +6,14 @@ class BaseController {
 public:
     virtual ~BaseController() = default;
     
-    // 纯虚函数：所有控制器必须实现
-    virtual double ComputeSteering(double error, double speed) = 0;
+    // ✅ 修改：增加 current_heading 参数，Pure Pursuit 和 Stanley 都需要它
+    // error: 横向误差 (m)
+    // speed: 当前速度 (m/s)
+    // curvature: 路径曲率 (1/m)
+    // current_heading: 车辆当前航向 (rad)
+    virtual double ComputeSteering(double error, double speed, double curvature, double current_heading) = 0;
     
-    // 虚函数：可选重写
     virtual std::string GetName() const { return "BaseController"; }
-    virtual void Init() { /* 默认空实现 */ }
-    
-    // 参数接口：基类提供默认行为
-    virtual void SetGains(double p, double i, double d) {
-        // 空实现：非 PID 算法可忽略
-    }
+    virtual void Init() {}
+    virtual void SetGains(double p, double i, double d) {}
 };

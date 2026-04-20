@@ -5,7 +5,9 @@
 StanleyController::StanleyController(double kp, double ktheta, double max_steer)
     : k_p_(kp), k_theta_(ktheta), max_steer_(max_steer) {}
 
-double StanleyController::ComputeSteering(double lateral_error, double speed) {
+double StanleyController::ComputeSteering(double lateral_error, double speed, double curvature, double current_heading) {
+    (void)curvature;
+    (void)current_heading;
     // 🛡️ 防零速除错
     double v_safe = std::max(speed, 0.5); 
     
