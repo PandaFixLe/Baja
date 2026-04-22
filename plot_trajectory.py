@@ -41,7 +41,7 @@ def plot_trajectory(ref_path, car_traj, save_path=None):
     max_error = np.max(errors)
 
     # 设置图表属性
-    plt.title(f'巴哈赛车轨迹跟踪 - PurePursuit控制器\n平均误差: {avg_error:.3f}m, 最大误差: {max_error:.3f}m', fontsize=14)
+    plt.title(f'巴哈赛车轨迹跟踪\n平均误差: {avg_error:.3f}m, 最大误差: {max_error:.3f}m', fontsize=14)
     plt.xlabel('X 位置 (m)', fontsize=12)
     plt.ylabel('Y 位置 (m)', fontsize=12)
     plt.grid(True, alpha=0.3)

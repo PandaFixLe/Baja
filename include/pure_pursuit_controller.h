@@ -18,14 +18,25 @@ private:
     double emergency_lookahead_;  // 急弯时的紧急预瞄距离
     bool emergency_mode_active_;  // 是否处于超急弯状态，用于抑制重复日志输出
     bool emergency_log_printed_;
+    int s_bend_lock_frames_ = 0;
+    bool prev_sign_negative_ = false;
 
+    double prev_steering_ = 0.0;
+    static constexpr double MAX_STEER_RATE = 0.5;  // rad/s
+    static constexpr double DT = 0.02;  // 仿真步长
 public:
     // 构造函数：预瞄距离 + 轴距 + 限幅
     PurePursuitController(double lookahead, double wheelbase = 1.5, double max_steer = 0.6);
     
     // 核心算法（必须实现）
     // 新增：curvature参数用于应对发卡弯
-    double ComputeSteering(double error, double speed, double curvature = 0.0,double current_heading= 0.0) override;
+    // pure_pursuit_controller.h - 修改函数声明
+    double ComputeSteering(
+        double lateral_error_raw,  // [保留] 原始误差（兼容旧代码）
+        double speed,
+        double path_curvature = 0.0,
+        double current_heading = 0.0) override;
+    
     
     // 重写接口
     std::string GetName() const override;

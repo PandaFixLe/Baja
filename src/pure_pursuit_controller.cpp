@@ -32,30 +32,58 @@ PurePursuitController::PurePursuitController(double lookahead, double wheelbase,
     }
 }
 
-double PurePursuitController::ComputeSteering(double error, double speed, double curvature, double current_heading) {
+// pure_pursuit_controller.cpp - 修改实现
+double PurePursuitController::ComputeSteering(
+    double lateral_error_raw, 
+    double speed, 
+    double path_curvature, 
+    double current_heading) {
     (void)current_heading;
-    // 1. 根据速度和曲率动态调整预瞄距离 (这个保留，用于调参)
-    UpdateParameters(speed, curvature);
+
+    // 1. 动态调整预瞄距离
+    UpdateParameters(speed, path_curvature);
+    const double min_safe_lookahead = std::max(L_min_, wheelbase_ * 1.5);
+    double dynamic_lookahead = std::clamp(lookahead_, min_safe_lookahead, L_max_);
+    const double local_curv = std::abs(path_curvature);
+    const double max_lookahead_for_curve =
+        (local_curv < 0.05) ? L_max_ : ((local_curv < 0.15) ? 3.0 : 2.0);
+    dynamic_lookahead = std::min(dynamic_lookahead, max_lookahead_for_curve);
+
+    // 2. Pure Pursuit 几何公式
+    double required_curvature =
+        (2.0 * lateral_error_raw) / (dynamic_lookahead * dynamic_lookahead);
+
+    // 3. 限制目标曲率，避免预瞄过短或误差过大时直接打满方向
+    const double max_curvature = std::tan(max_steer_angle_) / wheelbase_;
+    required_curvature = std::clamp(required_curvature, -max_curvature, max_curvature);
+
+    // 4. 反馈主导，前馈只在方向一致或误差较小时轻量叠加，避免“打架”
+    double feedback = std::atan(wheelbase_ * required_curvature);
+    double feedforward = std::atan(wheelbase_ * path_curvature);
+    const bool same_direction = (feedback * feedforward >= 0.0);
+    double feedforward_weight = 0.20;
+    if (!same_direction) {
+        feedforward_weight = 0.0;
+    }
+    if (local_curv > 0.05 && local_curv < 0.2 && same_direction) {
+        feedforward_weight = 0.40;
+    }
+    if (std::abs(lateral_error_raw) < 0.2 && same_direction) {
+        feedforward_weight = std::max(feedforward_weight, 0.30);
+    }
+
+    double steering_angle = feedforward * feedforward_weight + feedback * (1.0 - feedforward_weight);
     
-    double dynamic_lookahead = lookahead_;
-    
-    // 2. ✅ 修正核心算法：Pure Pursuit 必须基于几何误差计算
-    // 公式：k = 2 * lateral_error / L^2
-    // 注意：error 是有符号的，决定了向左还是向右转
-    
-    // 删除之前的 if (curvature != 0.0) 判断！
-    // 强制使用反馈控制公式
-    double path_curvature = (2.0 * error) / (dynamic_lookahead * dynamic_lookahead);
-    
-    // 3. 计算转向角：delta = atan(L * k)
-    double steering_angle = std::atan2(wheelbase_ * path_curvature, 1.0);
-    
-    // 4. 转向限幅
+    // 5. 绝对值限幅（先限幅，再做变化率限制）
     steering_angle = std::clamp(steering_angle, -max_steer_angle_, max_steer_angle_);
-    
-    // 调试输出（可选）
-    // std::cout << "[PP] error=" << error << " L=" << dynamic_lookahead 
-    //           << " -> steer=" << steering_angle << "\n";
+
+    // 6. 转角变化率限幅（保护舵机+防震荡）
+    double steering_delta = steering_angle - prev_steering_;
+    if (std::abs(steering_delta) > MAX_STEER_RATE * DT) {
+        steering_angle = prev_steering_ + std::copysign(MAX_STEER_RATE * DT, steering_delta);
+    }
+    steering_angle = std::clamp(steering_angle, -max_steer_angle_, max_steer_angle_);
+    prev_steering_ = steering_angle;
     
     return steering_angle;
 }
@@ -75,51 +103,60 @@ void PurePursuitController::SetLookahead(double lookahead) {
 
 // 新增：根据速度和曲率动态更新参数
 void PurePursuitController::UpdateParameters(double speed, double curvature) {
-    // 1. 计算目标预瞄距离（保持你原有的逻辑）
+    // 1. 计算基础预瞄距离
+    const double hairpin_lookahead = std::max(1.5 * wheelbase_, L_min_);
     double base_lookahead = L_min_ + k_gain_ * speed;
     double abs_curvature = std::abs(curvature);
-    
-    if (abs_curvature > curvature_threshold_) {
-        double curvature_factor = curvature_threshold_ / abs_curvature;
-        base_lookahead = std::max(emergency_lookahead_, base_lookahead * curvature_factor);
+    bool cur_sign_negative = (curvature < 0.0);
+    if (abs_curvature > 0.03 && cur_sign_negative != prev_sign_negative_) {
+        s_bend_lock_frames_ = 25;
     }
-    base_lookahead = std::clamp(base_lookahead, L_min_, L_max_);
+    prev_sign_negative_ = cur_sign_negative;
 
-    // 🔹 新增：判断是否处于“紧急模式”（超急弯）
+    if (abs_curvature > curvature_threshold_) {
+        double curvature_factor = std::sqrt(curvature_threshold_ / abs_curvature);
+        base_lookahead = std::max(hairpin_lookahead, base_lookahead * curvature_factor);
+    }
+
+    if (abs_curvature > 0.05) {
+        base_lookahead = std::min(base_lookahead, 3.0);
+    }
+    if (abs_curvature > 0.15) {
+        base_lookahead = std::min(base_lookahead, 2.0);
+    }
+
     bool is_emergency = (abs_curvature > 0.25);
 
     if (is_emergency) {
-        // 超急弯：强制缩短预瞄距离，并标记为紧急状态
-        lookahead_ = std::max(0.6, base_lookahead * 0.5);
+        const double target_lookahead = std::clamp(hairpin_lookahead, L_min_, L_max_);
+        const double smoothing_factor = 0.35;
+        lookahead_ = lookahead_ * (1.0 - smoothing_factor) + target_lookahead * smoothing_factor;
         emergency_mode_active_ = true;
-        
-        // ✅ 修改：只在变化较大时打印日志，避免重复
-        if (std::abs(lookahead_ - base_lookahead) > 0.3 && !emergency_log_printed_) {
-            std::cout << "[PurePursuit] 🚨 超急弯！预瞄紧急缩短至" << lookahead_ << "m (曲率=" << abs_curvature << ")\n";
-            emergency_log_printed_ = true;  // 标记已打印
+
+        if (!emergency_log_printed_) {
+            std::cout << "[PurePursuit] 🚨 超急弯！预瞄收敛到 " << lookahead_
+                      << "m (目标=" << target_lookahead
+                      << "m, 曲率=" << abs_curvature << ")\n";
+            emergency_log_printed_ = true;
         }
     } else {
-        // 恢复阶段：缓慢增加预瞄距离，避免突变
-        if (emergency_mode_active_) {
-            // 渐进恢复：每次只增加 10%
-            double recovery_factor = 0.1;
-            double target_lookahead = lookahead_ * (1 - recovery_factor) + base_lookahead * recovery_factor;
-            lookahead_ = std::min(target_lookahead, base_lookahead); // 不超过正常值
+        if (s_bend_lock_frames_ > 0) {
+            base_lookahead = std::max(L_min_, wheelbase_ * 1.5);
+            lookahead_ = base_lookahead;
+            --s_bend_lock_frames_;
+            emergency_mode_active_ = true;
         } else {
-            // 正常情况：使用低通滤波（20%权重）
-            double smoothing_factor = 0.2;
-            double target_lookahead = lookahead_ * (1 - smoothing_factor) + base_lookahead * smoothing_factor;
-            lookahead_ = target_lookahead;
-    
+            double smoothing_factor = emergency_mode_active_ ? 0.08 : 0.12;
+            if (emergency_mode_active_) {
+                lookahead_ = std::min(
+                    lookahead_ * (1.0 - smoothing_factor) + base_lookahead * smoothing_factor,
+                    base_lookahead);
+            } else {
+                lookahead_ = lookahead_ * (1.0 - smoothing_factor) + base_lookahead * smoothing_factor;
+            }
+            emergency_mode_active_ = false;
         }
-
-        // 只有变化较大时才打印日志
-        if (std::abs(lookahead_ - base_lookahead) > 0.3) {
-            std::cout << "[PurePursuit] ⚠️ 预瞄大幅调整: " << base_lookahead << "m -> " << lookahead_ << "m\n";
-        }
-
-        emergency_mode_active_ = false;
-        emergency_log_printed_ = false;  // 重置标志位
+        emergency_log_printed_ = false;
     }
 }
 

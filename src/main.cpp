@@ -28,67 +28,96 @@ struct TestResult {
     }
 };
 
-TestResult RunSimulation(BaseController* controller, MockPathGenerator& mock_gen,
-                        double test_speed, bool verbose = false,
-                        std::vector<std::tuple<double,double,double>>* trajectory = nullptr) {
+// ✅ 替换原有的 RunSimulation 函数
+TestResult RunSimulation(BaseController* controller, MockPathGenerator& mock_gen, 
+                        double test_speed, bool verbose = false, 
+                        std::vector<std::tuple<double, double, double>>* trajectory = nullptr) {
     mock_gen.Reset();
 
-    double current_x = 5.0;
-    double current_y = 1.0;
-    double current_heading = 0.0;
+    // 状态变量
+    double current_x = 0.0, current_y = 0.0, current_heading = 0.0;
+    double current_speed = 0.0;
     double total_error = 0.0, total_steering = 0.0, max_error = 0.0;
     double max_steering_observed = 0.0;
     double prev_steering = 0.0;
     double total_jerk = 0.0;
-    const double MAX_STEER_LIMIT = 0.6;
+    const double MAX_STEER_LIMIT = 0.6; 
 
     std::vector<double> steering_history;
-    int large_error_count = 0;
 
     if (verbose) {
-        std::cout << "\n=== 开始仿真：" << controller->GetName() << " ===\n";
-        std::cout << "--------------------------------------------------\n";
+        std::cout << "\n=== 开始仿真: " << controller->GetName() << " ===\n";
     }
 
-    const int TOTAL_FRAMES = 1000;
-    for (int i = 0; i < TOTAL_FRAMES; ++i) {
+    const auto& full_path = mock_gen.GetAllPoints();
+    const double dt = 0.02;
+    double track_length = 0.0;
+    for (size_t i = 1; i < full_path.size(); ++i) {
+        track_length += std::hypot(
+            full_path[i].x - full_path[i - 1].x,
+            full_path[i].y - full_path[i - 1].y);
+    }
+    const double min_safe_speed = 1.5;
+    const int MAX_FRAMES = static_cast<int>((track_length / (min_safe_speed * dt)) * 1.3);
+    int frames_run = 0;
+    PIDController speed_pid(1.4, 0.15, 0.05, 8.0, 2.5);
+
+    for (int i = 0; i < MAX_FRAMES; ++i) {
+        frames_run = i + 1;
+        // 1. 获取预瞄距离
         double lookahead_dist = 2.0;
         auto* pp_ctrl = dynamic_cast<PurePursuitController*>(controller);
         if (pp_ctrl) lookahead_dist = pp_ctrl->GetLookahead();
 
-        PathPoint ref_point = mock_gen.GetTargetPoint(current_x, current_y, lookahead_dist);
+        // 2. 获取最近路径点和目标点
+        size_t closest_index = mock_gen.GetClosestIndex(current_x, current_y);
+        PathPoint closest_point = full_path[closest_index];
+        PathPoint ref_point = mock_gen.GetTargetPoint(
+            current_x, current_y, current_heading, lookahead_dist);
 
+        // 3. 计算目标点相对车辆的局部坐标
         double dx = ref_point.x - current_x;
         double dy = ref_point.y - current_y;
-        double path_yaw = ref_point.heading;
-        double lateral_error = -std::sin(path_yaw) * dx + std::cos(path_yaw) * dy;
+        double target_local_x = dx * std::cos(current_heading) + dy * std::sin(current_heading);
+        double target_local_y = -dx * std::sin(current_heading) + dy * std::cos(current_heading);
 
-        if (pp_ctrl && verbose) {
-            std::cout << "[Frame " << i << "] 当前预瞄距离："
-                      << pp_ctrl->GetLookahead() << " m, 曲率："
-                      << ref_point.curvature << " 1/m" << std::endl;
+        // 仍然保留最近路径点坐标系误差用于统计观察
+        double closest_dx = closest_point.x - current_x;
+        double closest_dy = closest_point.y - current_y;
+        double precise_lateral_error = -closest_dx * std::sin(closest_point.heading)
+                                       + closest_dy * std::cos(closest_point.heading);
+
+        double controller_error = precise_lateral_error;
+        if (dynamic_cast<PurePursuitController*>(controller)) {
+            controller_error = target_local_y;
         }
 
-        // ✅ 最小修改：增加 current_heading 参数
+        double heading_error = std::atan2(
+            std::sin(closest_point.heading - current_heading),
+            std::cos(closest_point.heading - current_heading));
+        if (pp_ctrl) {
+            controller_error += 0.8 * lookahead_dist * heading_error;
+        }
+
+        double curvature_speed_limit = std::clamp(
+            test_speed - 3.0 * std::abs(closest_point.curvature), 1.5, test_speed);
+        double target_speed = std::min(closest_point.speed_limit, curvature_speed_limit);
+        target_speed = std::clamp(target_speed, 0.8, test_speed);
+        double speed_command = speed_pid.Compute(target_speed, current_speed, dt);
+        current_speed += speed_command * dt;
+        current_speed = std::clamp(current_speed, 0.0, test_speed);
+
+        // 4. 控制器计算
         double steering = controller->ComputeSteering(
-            lateral_error,
-            test_speed,
-            ref_point.curvature,
+            controller_error,
+            current_speed,
+            closest_point.curvature,
             current_heading
         );
 
-        double abs_err = std::abs(lateral_error);
+        // 5. 统计指标
+        double abs_err = std::abs(precise_lateral_error);
         double abs_steer = std::abs(steering);
-
-        if (abs_err > 2.5) {
-            large_error_count++;
-            if (large_error_count >= 3 && verbose) {
-                std::cout << "⚠️ 警告：连续大误差，建议检查参数或感知模块\n";
-            }
-        } else {
-            large_error_count = 0;
-        }
-
         total_error += abs_err;
         total_steering += abs_steer;
         if (abs_err > max_error) max_error = abs_err;
@@ -99,48 +128,55 @@ TestResult RunSimulation(BaseController* controller, MockPathGenerator& mock_gen
         prev_steering = steering;
 
         steering_history.push_back(steering);
-        if (steering_history.size() > 10) {
-            steering_history.erase(steering_history.begin());
-        }
+        if (steering_history.size() > 10) steering_history.erase(steering_history.begin());
 
-        double L = 1.5;
-        double yaw_rate = (test_speed / L) * std::tan(steering);
-        current_heading += yaw_rate * 0.02;
-        current_x += test_speed * std::cos(current_heading) * 0.02;
-        current_y += test_speed * std::sin(current_heading) * 0.02;
-
+        // 6. ✅ 关键：记录轨迹 (在位置更新后记录)
         if (trajectory) {
             trajectory->emplace_back(current_x, current_y, current_heading);
         }
 
-        if (verbose && i % 10 == 0) {
-            std::cout << "t=" << (i * 0.02) << "s | "
-                      << "参考=(" << ref_point.x << ", " << ref_point.y << ") | "
-                      << "误差=" << lateral_error << "m | "
-                      << "转角=" << steering << "rad\n";
+        // 7. 车辆运动学更新
+        double L = 1.5;
+        double yaw_rate = (current_speed / L) * std::tan(steering);
+        current_heading += yaw_rate * dt;
+        current_x += current_speed * std::cos(current_heading) * dt;
+        current_y += current_speed * std::sin(current_heading) * dt;
+
+        // 8. 日志输出
+        if (verbose && i % 50 == 0) {
+            std::cout << "t=" << (i * 0.02)
+                      << "s | CTE=" << precise_lateral_error
+                      << "m | LocalY=" << target_local_y
+                      << "m | LocalX=" << target_local_x
+                      << "m | HeadingErr=" << heading_error
+                      << "rad | Speed=" << current_speed
+                      << "m/s | TargetSpeed=" << target_speed
+                      << "m/s | Steer=" << steering << "rad\n";
+        }
+
+        if (closest_index >= mock_gen.GetTotalPoints() - 15 && i > 100) {
+            if (verbose) {
+                std::cout << "[RunSimulation] 路径进度到达终点附近，提前结束。index="
+                          << closest_index << "/" << full_path.size() << "\n";
+            }
+            break;
         }
     }
 
-    if (verbose) {
-        std::cout << "--------------------------------------------------\n";
-        std::cout << "✅ 仿真完成！\n";
-    }
-
+    // 震荡检测
     int sign_changes = 0;
     for (size_t i = 1; i < steering_history.size(); ++i) {
         if (steering_history[i] * steering_history[i-1] < 0) sign_changes++;
     }
-    TestResult result;
-    bool severe_oscillation = (sign_changes > 6);
-    result.oscillation = severe_oscillation;
 
+    TestResult result;
     result.algo_name = controller->GetName();
     result.parameter_value = 0.0;
     result.max_error = max_error;
-    result.avg_error = total_error / TOTAL_FRAMES;
-    result.avg_steering = total_steering / TOTAL_FRAMES;
+    result.avg_error = total_error / frames_run;
+    result.avg_steering = total_steering / frames_run;
     result.oscillation = (sign_changes > 4);
-    result.steering_jerk = total_jerk / TOTAL_FRAMES;
+    result.steering_jerk = total_jerk / frames_run;
     result.max_steering_util = max_steering_observed / MAX_STEER_LIMIT;
 
     return result;
@@ -285,10 +321,10 @@ const TestResult* FindBestResult(const std::vector<TestResult>& results) {
 }
 
 std::unique_ptr<BaseController> CreateController(const std::string& name, double param) {
-    if (name == "Stanley_Controller") {
+    if (name == "Stanley_Controller" || name == "Stanley") {
         return std::make_unique<StanleyController>(param, 1.0, 0.6);
     } else {
-        auto ctrl = std::make_unique<PurePursuitController>(2.0, 1.5, 0.6);
+        auto ctrl = std::make_unique<PurePursuitController>(param, 1.5, 0.6);
         ctrl->SetDynamicParameters(0.3, 1.0, 4.0);
         ctrl->SetCurvatureParameters(0.15, 0.8);
         return ctrl;
@@ -308,13 +344,13 @@ std::vector<TestResult> RunParameterScan() {
         pp->SetCurvatureParameters(0.15, 0.8);
 
         TestResult res = RunSimulation(pp.get(), mock_gen, 3.0, false);
-        res.algo_name = "PurePursuit";
+        res.algo_name = "PurePursuit_Controller";
         res.parameter_value = param;
         results.push_back(res);
 
         auto stanley = std::make_unique<StanleyController>(param, 1.0, 0.6);
         res = RunSimulation(stanley.get(), mock_gen, 3.0, false);
-        res.algo_name = "Stanley";
+        res.algo_name = "Stanley_Controller";
         res.parameter_value = param;
         results.push_back(res);
     }

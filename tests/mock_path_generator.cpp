@@ -1,9 +1,10 @@
 #include "mock_path_generator.h"
+#include <algorithm>
 #include <iostream>
 #include <cmath>
 
 MockPathGenerator::MockPathGenerator() 
-    : current_idx_(0), current_x_(0.0), current_y_(0.0), current_heading_(0.0) {
+    : current_idx_(0), target_idx_(0), current_x_(0.0), current_y_(0.0), current_heading_(0.0) {
     std::cout << "[MockPathGenerator] 初始化完成\n";
 }
 
@@ -12,6 +13,7 @@ MockPathGenerator::~MockPathGenerator() {}
 void MockPathGenerator::Clear() {
     path_.clear();
     current_idx_ = 0;
+    target_idx_ = 0;
     current_x_ = 0.0;
     current_y_ = 0.0;
     current_heading_ = 0.0;
@@ -19,6 +21,7 @@ void MockPathGenerator::Clear() {
 
 void MockPathGenerator::Reset() {
     current_idx_ = 0;
+    target_idx_ = 0;
 }
 
 bool MockPathGenerator::IsFinished() const {
@@ -36,14 +39,15 @@ PathPoint MockPathGenerator::GetNextPoint() {
     return PathPoint();
 }
 
-// 在 mock_path_generator.cpp 中实现
-PathPoint MockPathGenerator::GetTargetPoint(double car_x, double car_y, double lookahead_dist) {
-    if (path_.empty()) return PathPoint();
+size_t MockPathGenerator::GetClosestIndex(double car_x, double car_y) {
+    if (path_.empty()) return 0;
 
-    // 1. 找最近点
-    size_t closest_idx = 0;
+    size_t search_start = (target_idx_ > 12) ? (target_idx_ - 12) : 0;
+    size_t search_end = std::min(path_.size(), target_idx_ + 30);
+    size_t closest_idx = search_start;
     double min_dist = 1e9;
-    for (size_t i = 0; i < path_.size(); ++i) {
+
+    for (size_t i = search_start; i < search_end; ++i) {
         double d = std::hypot(path_[i].x - car_x, path_[i].y - car_y);
         if (d < min_dist) {
             min_dist = d;
@@ -51,19 +55,90 @@ PathPoint MockPathGenerator::GetTargetPoint(double car_x, double car_y, double l
         }
     }
 
-    // 2. 沿路径累积距离
-    double accumulated_dist = 0;
-    // ✅ 修复：从 closest_idx 开始，不要漏掉第一段
-    for (size_t i = closest_idx; i < path_.size() - 1; ++i) {
-        double seg_len = std::hypot(path_[i+1].x - path_[i].x, path_[i+1].y - path_[i].y);
-        accumulated_dist += seg_len;
-        
-        // ✅ 修复：当累积距离达到预瞄值，返回当前段的终点 (i+1)，或者进行插值
-        // 简单起见，返回超过阈值的那个点，这样预瞄距离只会偏大一点点，比偏小好
-        if (accumulated_dist >= lookahead_dist) {
-            return path_[i+1]; 
+    return closest_idx;
+}
+
+PathPoint MockPathGenerator::GetClosestPoint(double car_x, double car_y) {
+    if (path_.empty()) return PathPoint();
+    return path_[GetClosestIndex(car_x, car_y)];
+}
+
+// 在 mock_path_generator.cpp 中实现
+PathPoint MockPathGenerator::GetTargetPoint(
+    double car_x,
+    double car_y,
+    double car_heading,
+    double lookahead_dist) {
+    if (path_.empty()) return PathPoint();
+
+    // 1. 仅在当前目标点附近向前搜索最近点，避免目标点在 S 弯中来回跳变
+    size_t search_start = (target_idx_ > 8) ? (target_idx_ - 8) : 0;
+    size_t search_end = std::min(path_.size(), target_idx_ + 25);
+    size_t closest_idx = search_start;
+    double min_dist = 1e9;
+    for (size_t i = search_start; i < search_end; ++i) {
+        double d = std::hypot(path_[i].x - car_x, path_[i].y - car_y);
+        if (d < min_dist) {
+            min_dist = d;
+            closest_idx = i;
         }
     }
+
+    // 2. 仅接受车前方的点，避免在弯道/回头弯里选中车后方目标点
+    const double heading_x = std::cos(car_heading);
+    const double heading_y = std::sin(car_heading);
+    const double min_forward_projection = 0.3;
+    const size_t max_forward_steps = 20;
+
+    // 3. 沿路径弧长向前查找并插值，减少离散点跳变
+    double accumulated_dist = 0.0;
+    PathPoint best_forward_point = path_[closest_idx];
+    bool found_forward_point = false;
+
+    for (size_t i = closest_idx; i < path_.size() - 1; ++i) {
+        if (i - closest_idx > max_forward_steps) {
+            break;
+        }
+
+        const PathPoint& seg_start = path_[i];
+        const PathPoint& seg_end = path_[i + 1];
+        double seg_len = std::hypot(seg_end.x - seg_start.x, seg_end.y - seg_start.y);
+        if (seg_len < 1e-6) continue;
+
+        const PathPoint& candidate = seg_end;
+        double rel_x = candidate.x - car_x;
+        double rel_y = candidate.y - car_y;
+        double forward_projection = rel_x * heading_x + rel_y * heading_y;
+
+        if (forward_projection > min_forward_projection) {
+            best_forward_point = candidate;
+            found_forward_point = true;
+        }
+
+        if (accumulated_dist + seg_len >= lookahead_dist && forward_projection > min_forward_projection) {
+            double remain = lookahead_dist - accumulated_dist;
+            double ratio = std::clamp(remain / seg_len, 0.0, 1.0);
+
+            PathPoint interpolated;
+            interpolated.x = seg_start.x + ratio * (seg_end.x - seg_start.x);
+            interpolated.y = seg_start.y + ratio * (seg_end.y - seg_start.y);
+            interpolated.heading = seg_start.heading + ratio * (seg_end.heading - seg_start.heading);
+            interpolated.curvature = seg_start.curvature + ratio * (seg_end.curvature - seg_start.curvature);
+            interpolated.speed_limit = seg_start.speed_limit + ratio * (seg_end.speed_limit - seg_start.speed_limit);
+            interpolated.timestamp = seg_start.timestamp + ratio * (seg_end.timestamp - seg_start.timestamp);
+            target_idx_ = i;
+            return interpolated;
+        }
+
+        accumulated_dist += seg_len;
+    }
+
+    if (found_forward_point) {
+        target_idx_ = closest_idx;
+        return best_forward_point;
+    }
+
+    target_idx_ = path_.size() - 1;
     return path_.back();
 }
 

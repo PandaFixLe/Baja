@@ -13,7 +13,7 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 # 方式 A：手动列出（推荐，明确可控）
 set(SOURCES
     src/main.cpp
-    
+    src/pid_controller.cpp
     src/pure_pursuit_controller.cpp
     tests/mock_path_generator.cpp
     src/stanley_controller.cpp

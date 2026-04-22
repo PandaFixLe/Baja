@@ -14,11 +14,9 @@ fi
 mkdir -p build
 cd build
 
-# 如果可执行文件不存在，则重新配置并编译
-if [ ! -x "controller" ]; then
-  cmake ..
-  make controller
-fi
+# 每次都重新构建，避免源码改了但还在跑旧二进制
+cmake ..
+make controller
 
 # 运行仿真并生成轨迹数据
 ./controller

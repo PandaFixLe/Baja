@@ -27,7 +27,9 @@ public:
     MockPathGenerator();
     ~MockPathGenerator();
     
-    PathPoint GetTargetPoint(double car_x, double car_y, double lookahead_dist);
+    size_t GetClosestIndex(double car_x, double car_y);
+    PathPoint GetClosestPoint(double car_x, double car_y);
+    PathPoint GetTargetPoint(double car_x, double car_y, double car_heading, double lookahead_dist);
 
     void Clear();
     PathPoint GetNextPoint();
@@ -53,6 +55,7 @@ public:
 private:
     std::vector<PathPoint> path_;
     size_t current_idx_;
+    size_t target_idx_;
     double current_x_;
     double current_y_;
     double current_heading_;
